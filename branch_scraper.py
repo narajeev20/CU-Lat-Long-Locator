@@ -148,7 +148,12 @@ def geocode_address(address):
     global _geocoder, _geocode_limited
     if _geocoder is None:
         _geocoder = Nominatim(user_agent="credit-union-branch-scraper/1.0")
-        _geocode_limited = RateLimiter(_geocoder.geocode, min_delay_seconds=1.0)
+        _geocode_limited = RateLimiter(
+            _geocoder.geocode,
+            min_delay_seconds=2.0,
+            max_retries=3,
+            error_wait_seconds=10.0,
+        )
     try:
         loc = _geocode_limited(address)
         if loc:
