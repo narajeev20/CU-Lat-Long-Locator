@@ -5,7 +5,7 @@ A web app that scrapes a credit union (or any) website for branch locations and 
 ## Setup
 
 ```bash
-cd /Users/nityarajeev/python
+cd cu-lat-long-locator
 python3 -m venv .venv   # if you don't already have one
 source .venv/bin/activate   # or: .venv\Scripts\activate on Windows
 pip install -r requirements.txt
@@ -13,7 +13,10 @@ pip install -r requirements.txt
 
 ## Run
 
+From inside the `cu-lat-long-locator` folder:
+
 ```bash
+cd cu-lat-long-locator
 python app.py
 ```
 
