@@ -6,12 +6,16 @@ Branch-to-address matching is scoped: find the branch name node first,
 then only search for address within the same local container (or next sibling).
 """
 import re
+import time
+import logging
 import requests
 from bs4 import BeautifulSoup
 from typing import Optional
 
 from geopy.geocoders import Nominatim
-from geopy.extra.rate_limiter import RateLimiter
+from geopy.exc import GeocoderTimedOut, GeocoderServiceError
+
+logger = logging.getLogger(__name__)
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
@@ -23,6 +27,30 @@ ADDRESS_PATTERN = re.compile(
 )
 SIMPLE_ADDRESS = re.compile(
     r"[\w\s\.\-]{3,80},?\s*[A-Za-z]{2}\s*,?\s*\d{5}(?:-\d{4})?",
+    re.IGNORECASE,
+)
+
+# ── Patterns ───────────────────────────────────────────────────────────────
+
+# href patterns that indicate a maps link (real URL or local anchor)
+_MAPS_HREF = re.compile(
+    r"(maps\.app\.goo\.gl|maps\.google\.|goo\.gl/maps|apple\.com/maps"
+    r"|bing\.com/maps|mapquest\.com|#.*map)",
+    re.IGNORECASE,
+)
+
+# Class/id names that strongly indicate an address container
+_ADDR_CLASS = re.compile(
+    r"(address|location|branch.?info|contact.?info|company_information__location)",
+    re.IGNORECASE,
+)
+
+# Noise lines we want to discard before scoring
+_NOISE = re.compile(
+    r"(phone|fax|tel:|toll.?free|hours?|open|closed|"
+    r"mon|tue|wed|thu|fri|sat|sun|"
+    r"drive.?thru|lobby|directions|watch|webcam|call\s|"
+    r"get\s+directions|view\s+map|click\s+here)",
     re.IGNORECASE,
 )
 
@@ -65,7 +93,6 @@ def _fuzzy_match(target_branch_name: str, candidate_text: str, threshold: float 
     if target_tok <= cand_tok:
         return True
     inter = len(target_tok & cand_tok)
-    # similarity: share of target tokens present in candidate
     sim = inter / len(target_tok) if target_tok else 0
     return sim >= threshold
 
@@ -91,50 +118,103 @@ def _find_branch_node(soup: BeautifulSoup, target_branch_name: str):
 
     if not candidates:
         return None
-    # Prefer shortest text (most specific heading)
     candidates.sort(key=lambda x: len(x[1]))
     return candidates[0][0]
 
 
 # --- Container scoping (Step 2) ---
 CONTAINER_TAGS = {"article", "section", "table", "tbody", "tr"}
-CONTAINER_CLASS_KEYWORDS = ("row", "container", "wrap", "card", "elementor", "widget")
+
+# Keywords that suggest a per-branch item container — we want to STOP here
+ITEM_CLASS_KEYWORDS = ("item", "card", "branch", "location", "office", "widget")
+
+# Keywords that suggest a broad shared wrapper — we want to SKIP past these
+WRAPPER_CLASS_KEYWORDS = ("boxes", "list", "grid", "wrap", "container", "row", "section")
 
 
-def _is_container_like(tag) -> bool:
+def _is_per_branch_container(tag) -> bool:
+    """True if this tag looks like a single-branch card/item, not a shared wrapper."""
     if tag.name in CONTAINER_TAGS:
         return True
-    cls = tag.get("class") or []
-    joined = " ".join(cls).lower() if isinstance(cls, list) else str(cls).lower()
-    return any(kw in joined for kw in CONTAINER_CLASS_KEYWORDS)
+    cls = " ".join(tag.get("class") or []).lower()
+    has_item = any(kw in cls for kw in ITEM_CLASS_KEYWORDS)
+    has_wrapper = any(kw in cls for kw in WRAPPER_CLASS_KEYWORDS)
+    # Prefer item-like classes; only treat as container if not purely a wrapper
+    return has_item or (tag.name == "div" and has_wrapper and not has_item is False)
+
+
+def _is_shared_wrapper(tag) -> bool:
+    """True if this tag is a broad container likely holding multiple branches."""
+    cls = " ".join(tag.get("class") or []).lower()
+    return any(kw in cls for kw in WRAPPER_CLASS_KEYWORDS) and not any(kw in cls for kw in ITEM_CLASS_KEYWORDS)
 
 
 def _has_content_beyond_heading(container, branch_node) -> bool:
-    """Container has more than just the branch heading."""
     branch_text_len = len(_get_candidate_text(branch_node))
     container_text = (container.get_text(separator=" ", strip=True) or "")
     return len(container_text.strip()) > branch_text_len + 5
 
 
 def _find_branch_container(branch_node):
-    """Walk up from branch_node to smallest ancestor that is a branch card/section."""
+    """
+    Walk up from branch_node to find the smallest ancestor that is a
+    per-branch container (item/card), stopping before any shared wrapper
+    that holds multiple branches.
+    """
     if not branch_node:
         return None
+
+    best = None
     node = branch_node
+
     while node and node.parent and node.parent.name not in ("html", "body"):
         parent = node.parent
-        if _is_container_like(parent) and _has_content_beyond_heading(parent, branch_node):
-            return parent
+        cls = " ".join(parent.get("class") or []).lower()
+
+        # Stop if we've reached a shared multi-branch wrapper
+        if _is_shared_wrapper(parent) and not any(kw in cls for kw in ITEM_CLASS_KEYWORDS):
+            break
+
+        if _is_per_branch_container(parent) and _has_content_beyond_heading(parent, branch_node):
+            best = parent  # Keep climbing to find the tightest fit
+
         node = parent
-    return branch_node.parent if branch_node.parent and branch_node.parent.name not in ("html", "body") else None
+
+    return best or (branch_node.parent if branch_node.parent and branch_node.parent.name not in ("html", "body") else None)
 
 
 def _next_element_sibling(tag):
-    """Next sibling that is a tag (element)."""
     n = tag.next_sibling
     while n and not (hasattr(n, "name") and n.name):
         n = n.next_sibling if hasattr(n, "next_sibling") else None
     return n
+
+
+def _find_table_branch_scope(branch_node):
+    """
+    Handle table-based layouts where the branch name is in a <th> inside one <tr>
+    and the address is in a <td> inside the next <tr>.
+    Returns a synthetic scope containing the next sibling <tr> content, or None.
+    """
+    # Walk up to the containing <tr>
+    node = branch_node
+    while node and node.name != "tr":
+        node = node.parent
+    if not node or node.name != "tr":
+        return None
+
+    # Gather this <tr> and the next 1-2 sibling <tr>s as the scope
+    from bs4 import BeautifulSoup as BS
+    scope_html = ""
+    tr = node
+    for _ in range(3):  # heading row + up to 2 data rows
+        tr = _next_element_sibling(tr)
+        if not tr or tr.name != "tr":
+            break
+        scope_html += str(tr)
+    if not scope_html:
+        return None
+    return BS(f"<div>{scope_html}</div>", "html.parser").find("div")
 
 
 # --- Address scoring (Step 3) ---
@@ -150,7 +230,6 @@ MIN_ADDRESS_SCORE = 8
 
 
 def _get_visible_text_with_br(el) -> str:
-    """Visible text with <br> treated as newline, then collapse whitespace."""
     if not el:
         return ""
     parts = []
@@ -184,7 +263,6 @@ def _score_address_candidate(text: str, has_address_label_nearby: bool = False) 
 
 
 def _extract_address_from_full_text(text: str) -> Optional[str]:
-    """Extract one address string from full text (for split-across-nodes)."""
     m = ADDRESS_PATTERN.search(text)
     if m:
         return m.group(0).strip()
@@ -194,16 +272,138 @@ def _extract_address_from_full_text(text: str) -> Optional[str]:
     return None
 
 
-def _find_address_in_scope(scope) -> Optional[str]:
-    """Collect candidate blocks from scope, score, return best address text or None."""
+# --- Noise stripping & address extraction strategies (Step 3b) ---
+
+def _strip_noise(text: str) -> str:
+    """
+    Remove noise lines (phone, hours, directions, etc.) from a text block.
+    Works line-by-line so address lines survive intact.
+    Also removes lines that look like bare phone numbers.
+    """
+    clean = []
+    for line in re.split(r"[\n|]", text):
+        line = line.strip().strip(",").strip()
+        if not line:
+            continue
+        if _NOISE.search(line):
+            continue
+        if re.fullmatch(r"[\d\s\.\-\(\)\+]{7,}", line):
+            continue
+        clean.append(line)
+    return ", ".join(clean)
+
+
+def _text_from_br_block(tag) -> str:
+    """
+    Reconstruct text from a tag that uses <br> as line separator
+    (common in Wix / plain-HTML sites). Returns joined non-empty lines.
+    """
+    parts = []
+    for child in tag.children:
+        if getattr(child, "name", None) == "br":
+            parts.append("\n")
+        elif hasattr(child, "get_text"):
+            parts.append(child.get_text(strip=True))
+        else:
+            parts.append(str(child).strip())
+    lines = [l.strip() for l in "".join(parts).split("\n") if l.strip()]
+    return ", ".join(lines)
+
+
+def _find_maps_link_address(scope) -> Optional[str]:
+    """
+    Strategy 1: address is the visible text of a maps hyperlink.
+    Covers real maps URLs and local anchors with 'map' in href.
+    Also checks for <strong> inside the link.
+    """
     if not scope:
         return None
-    candidate_tags = scope.find_all(["p", "div", "td", "strong", "a", "span", "li"], recursive=True)
+    for a in scope.find_all("a", href=True):
+        href = a.get("href", "")
+        if not _MAPS_HREF.search(href):
+            continue
+        strong = a.find("strong")
+        text = (strong or a).get_text(separator=" ", strip=True)
+        text = _strip_noise(text)
+        if text and _score_address_candidate(text) >= MIN_ADDRESS_SCORE:
+            return text
+    return None
+
+
+def _find_location_class_address(scope) -> Optional[str]:
+    """
+    Strategy 2: container has a class/id that explicitly names it as
+    an address or location block.
+    """
+    if not scope:
+        return None
+    for tag in scope.find_all(True):
+        cls = " ".join(tag.get("class") or [])
+        tid = tag.get("id") or ""
+        if not _ADDR_CLASS.search(cls) and not _ADDR_CLASS.search(tid):
+            continue
+        if tag.name == "a" and "tel:" in tag.get("href", ""):
+            continue
+        text = _strip_noise(tag.get_text(separator=" ", strip=True))
+        if text and _score_address_candidate(text) >= MIN_ADDRESS_SCORE:
+            return text
+    return None
+
+
+def _find_br_block_address(scope) -> Optional[str]:
+    """
+    Strategy 3: address split across <br>-separated lines inside a <p> or <div>
+    (Wix pattern: "105 S. Wall St.<br>Floydada, TX 79235").
+    Skips any block that contains a tel: link.
+    """
+    if not scope:
+        return None
+    for tag in scope.find_all(["p", "div", "td", "li"]):
+        if tag.find("a", href=re.compile(r"^tel:", re.I)):
+            continue
+        if not tag.find("br"):
+            continue
+        text = _strip_noise(_text_from_br_block(tag))
+        if text and _score_address_candidate(text) >= MIN_ADDRESS_SCORE:
+            return text
+    return None
+
+
+def _find_address_in_scope(scope) -> Optional[str]:
+    """
+    Try five strategies in order of reliability:
+      1. Maps hyperlink text (real URL or local #map anchor)
+      2. Semantically-named location/address class
+      3. <br>-separated lines in a <p>/<div> (Wix style)
+      4. Best-scoring individual element (noise-stripped)
+      5. Full container text regex fallback (noise-stripped)
+    """
+    if not scope:
+        return None
+
+    result = _find_maps_link_address(scope)
+    if result:
+        return result
+
+    result = _find_location_class_address(scope)
+    if result:
+        return result
+
+    result = _find_br_block_address(scope)
+    if result:
+        return result
+
+    # Strategy 4: score individual candidate elements, noise-stripped
     best_score = -100
     best_text = None
-    for tag in candidate_tags:
-        text = _get_visible_text_with_br(tag).strip()
-        if not text or len(text) < 10:
+    for tag in scope.find_all(["p", "div", "td", "strong", "span", "li"], recursive=True):
+        if tag.find("a", href=re.compile(r"^tel:", re.I)):
+            continue
+        raw = _get_visible_text_with_br(tag).strip()
+        if not raw or len(raw) < 10:
+            continue
+        text = _strip_noise(raw)
+        if not text:
             continue
         prev = tag.find_previous_sibling()
         has_label = bool(prev and "address" in (prev.get_text() or "").lower())
@@ -212,22 +412,26 @@ def _find_address_in_scope(scope) -> Optional[str]:
             best_score = score
             best_text = text
 
-    # Fallback / prefer full scope when address is split across nodes (e.g. two <strong>)
-    full = (scope.get_text(separator=" ", strip=True) or "").strip()
+    if best_text:
+        return best_text
+
+    # Strategy 5: full container text, noise-stripped, regex-extracted
+    full = _strip_noise(scope.get_text(separator="\n", strip=True))
     if len(full) >= 15:
         extracted = _extract_address_from_full_text(full)
-        if extracted and _score_address_candidate(extracted, False) >= MIN_ADDRESS_SCORE:
-            # Prefer extracted if it has zip and best_text doesn't (split-address case)
-            if re.search(r"\d{5}(?:-\d{4})?", extracted):
-                if not best_text or not re.search(r"\d{5}(?:-\d{4})?", best_text):
-                    best_text = extracted
-            elif not best_text:
-                best_text = extracted
-    return best_text
+        if extracted and _score_address_candidate(extracted) >= MIN_ADDRESS_SCORE:
+            return extracted
+
+    return None
 
 
 # --- Clean and parse (Step 4) ---
 CITY_STATE_ZIP_PARSE = re.compile(r"^(.*),\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)\s*$", re.IGNORECASE | re.DOTALL)
+
+STATES = (
+    "AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|"
+    "MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC"
+)
 
 
 def _clean_address(raw: str) -> str:
@@ -244,7 +448,6 @@ def _parse_address(address_full: str) -> dict:
         street = m.group(1).strip().rstrip(",")
         state = (m.group(2) or "").strip().upper()
         zip_ = (m.group(3) or "").strip()
-        # city is last part of street before state (e.g. "City Name" in "123 Main St, City Name, CA 90210")
         street_part = street
         if "," in street_part:
             parts = [p.strip() for p in street_part.split(",")]
@@ -262,10 +465,6 @@ def _parse_address(address_full: str) -> dict:
 
 # --- Main API: match branch to address (Steps 1–5) ---
 def match_branch_to_address(soup: BeautifulSoup, target_branch_name: str) -> dict:
-    """
-    Given page HTML (as BeautifulSoup) and target_branch_name, return matched branch and address.
-    Only searches for address within the local branch container (or its next sibling).
-    """
     out = {
         "matched_branch_name": "",
         "address_full": "",
@@ -281,12 +480,17 @@ def match_branch_to_address(soup: BeautifulSoup, target_branch_name: str) -> dic
     matched_text = _get_candidate_text(branch_node)
     out["matched_branch_name"] = matched_text
 
-    branch_container = _find_branch_container(branch_node)
-    address_full = _find_address_in_scope(branch_container)
-    if not address_full and branch_container:
-        next_scope = _next_element_sibling(branch_container)
-        if next_scope:
-            address_full = _find_address_in_scope(next_scope)
+    # For table layouts: address lives in the next sibling <tr>, not same container
+    table_scope = _find_table_branch_scope(branch_node)
+    if table_scope:
+        address_full = _find_address_in_scope(table_scope)
+    else:
+        branch_container = _find_branch_container(branch_node)
+        address_full = _find_address_in_scope(branch_container)
+        if not address_full and branch_container:
+            next_scope = _next_element_sibling(branch_container)
+            if next_scope:
+                address_full = _find_address_in_scope(next_scope)
 
     if not address_full:
         return out
@@ -300,12 +504,8 @@ def match_branch_to_address(soup: BeautifulSoup, target_branch_name: str) -> dic
     return out
 
 
-# --- Scrape + geocode (existing app contract) ---
+# --- Scrape + geocode ---
 def scrape_branches(url: str, branch_names: list) -> list:
-    """
-    Scrape url for each branch name and associate address via scoped matching.
-    Returns list of dicts: branch_name, address, latitude, longitude.
-    """
     branch_names = [n.strip() for n in branch_names if n.strip()]
     if not branch_names:
         return []
@@ -330,7 +530,7 @@ def scrape_branches(url: str, branch_names: list) -> list:
         address_full = (match.get("address_full") or "").strip()
         if address_full:
             row["address"] = address_full
-            lat, lon = geocode_address(address_full)
+            lat, lon = geocode_address(address_full, match)
             row["latitude"] = lat
             row["longitude"] = lon
         results.append(row)
@@ -338,36 +538,124 @@ def scrape_branches(url: str, branch_names: list) -> list:
     return results
 
 
-_geocoder = None
-_geocode_limited = None
+# --- Geocoding with multi-query variants + exponential backoff ---
+
+_geocoder: Optional[Nominatim] = None
+_last_geocode_time: float = 0.0
+
+MIN_DELAY_SECONDS = 3.0
+MAX_RETRIES = 6
 
 
-def geocode_address(address: str) -> tuple:
-    """Return (latitude, longitude) or (None, None)."""
-    global _geocoder, _geocode_limited
+def _get_geocoder() -> Nominatim:
+    global _geocoder
     if _geocoder is None:
         _geocoder = Nominatim(user_agent="credit-union-branch-scraper/1.0")
-        _geocode_limited = RateLimiter(
-            _geocoder.geocode,
-            min_delay_seconds=2.0,
-            max_retries=3,
-            error_wait_seconds=10.0,
-        )
-    try:
-        loc = _geocode_limited(address)
-        if loc:
-            return (loc.latitude, loc.longitude)
-    except Exception:
-        pass
+    return _geocoder
+
+
+def _build_query_variants(address_full: str, parsed: dict) -> list[str]:
+    """
+    Build ordered list of query strings to try, from most to least specific.
+    """
+    queries = []
+    street = parsed.get("street", "")
+    city   = parsed.get("city", "")
+    state  = parsed.get("state", "")
+    zip_   = parsed.get("zip", "")
+
+    # 1. Full structured query
+    if street and city and state:
+        queries.append(f"{street}, {city}, {state} {zip_}".strip())
+
+    # 2. Suite/unit stripped
+    clean_street = re.sub(r"\b(Suite|Ste|Unit|Apt|#)\s*\S+", "", street, flags=re.I).strip().rstrip(",").strip()
+    if clean_street != street and city and state:
+        queries.append(f"{clean_street}, {city}, {state} {zip_}".strip())
+
+    # 3. Direction expanded (E → East, W → West, etc.)
+    expanded = (street
+        .replace(" E ", " East ").replace(" W ", " West ")
+        .replace(" N ", " North ").replace(" S ", " South "))
+    if expanded != street and city and state:
+        queries.append(f"{expanded}, {city}, {state} {zip_}".strip())
+
+    # 4. State Route normalized — fall back to city+state+zip
+    if re.search(r"\b(state route|route|rte)\s*\d+", street, re.I) and city and state:
+        queries.append(f"{city}, {state} {zip_}".strip())
+
+    # 5. City + state + zip fallback
+    if city and state and zip_:
+        queries.append(f"{city}, {state} {zip_}")
+
+    # 6. Raw address string as last resort
+    if address_full.strip() not in queries:
+        queries.append(address_full.strip())
+
+    # Deduplicate while preserving order
+    seen = set()
+    deduped = []
+    for q in queries:
+        if q and q not in seen:
+            seen.add(q)
+            deduped.append(q)
+    return deduped
+
+
+def _geocode_query(geocoder: Nominatim, query: str) -> Optional[tuple]:
+    """
+    Attempt to geocode a single query string with exponential backoff retries.
+    Returns (lat, lon) on success, None on real miss, None on exhausted retries.
+    """
+    global _last_geocode_time
+
+    for attempt in range(MAX_RETRIES):
+        elapsed = time.time() - _last_geocode_time
+        wait = MIN_DELAY_SECONDS * (2 ** attempt) if attempt > 0 else MIN_DELAY_SECONDS
+        if elapsed < wait:
+            time.sleep(wait - elapsed)
+
+        try:
+            _last_geocode_time = time.time()
+            loc = geocoder.geocode(query, timeout=10)
+            if loc:
+                logger.info(f"  [GEO ✓] '{query}' → {loc.latitude}, {loc.longitude}")
+                return (loc.latitude, loc.longitude)
+            logger.info(f"  [GEO NONE MATCH] '{query}'")
+            return None  # Real miss — no point retrying
+        except (GeocoderTimedOut, GeocoderServiceError) as e:
+            logger.warning(f"  [GEO TIMEOUT/ERROR attempt {attempt + 1}/{MAX_RETRIES}] '{query}': {e}")
+            if attempt == MAX_RETRIES - 1:
+                logger.error(f"  [GEO FAIL FINAL] Exhausted retries for '{query}'")
+                return None
+
+    return None
+
+
+def geocode_address(address_full: str, parsed_match: Optional[dict] = None) -> tuple:
+    """
+    Geocode an address string. Builds multiple query variants and tries each
+    in order, with exponential backoff retries per query.
+    """
+    geocoder = _get_geocoder()
+    parsed = parsed_match or _parse_address(address_full)
+    queries = _build_query_variants(address_full, parsed)
+
+    logger.info(f"[GEOCODE] '{address_full}' — trying {len(queries)} query variant(s)")
+
+    for query in queries:
+        result = _geocode_query(geocoder, query)
+        if result is not None:
+            return result
+
+    logger.error(f"[GEO FAIL FINAL] No result for any variant of: '{address_full}'")
     return (None, None)
 
 
 # --- Unit-test style examples ---
 def _run_example_tests():
-    """Run example tests for branch-to-address matching."""
     from bs4 import BeautifulSoup as BS
 
-    # Example 1: heading in <h3> with address in nearby <strong> lines
     html1 = """
     <div class="branch-card">
       <h3>Main Branch</h3>
@@ -382,7 +670,6 @@ def _run_example_tests():
     assert "62701" in (r1["address_full"] or ""), r1
     print("Example 1 (h3 + strong): OK")
 
-    # Example 2: heading in <span class="contact-hdr-back"> with address after <strong>Address:</strong>
     html2 = """
     <section class="contact-wrap">
       <span class="contact-hdr-back">Downtown Office</span>
@@ -396,7 +683,6 @@ def _run_example_tests():
     assert "456" in (r2["address_full"] or "") and "60601" in (r2["address_full"] or ""), r2
     print("Example 2 (span.contact-hdr-back + Address:): OK")
 
-    # Example 3: heading in <h3 class="elementor-heading-title"> with address inside <a> and <strong>
     html3 = """
     <div class="elementor-widget">
       <h3 class="elementor-heading-title">Westside Branch</h3>
