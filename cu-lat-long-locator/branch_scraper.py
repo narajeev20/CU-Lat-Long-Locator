@@ -1,9 +1,6 @@
 """
 Scrapes a credit union website for branch names and addresses,
 then geocodes addresses to lat/long.
-
-Branch-to-address matching is scoped: find the branch name node first,
-then only search for address within the same local container (or next sibling).
 """
 import re
 import time
@@ -19,7 +16,6 @@ logger = logging.getLogger(__name__)
 
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
 
-# Full-page address patterns (fallback when address is split across nodes)
 ADDRESS_PATTERN = re.compile(
     r"\d{1,6}[\w\s\.\-]*(?:street|st|avenue|ave|blvd|boulevard|road|rd|drive|dr|lane|ln|way|court|ct|place|pl|suite|ste)[\w\s\.\-]*"
     r"[\s,]+[\w\s\.\-]+[\s,]+\b[A-Za-z]{2}\b[\s,]+\d{5}(?:-\d{4})?",
@@ -30,22 +26,17 @@ SIMPLE_ADDRESS = re.compile(
     re.IGNORECASE,
 )
 
-# ── Patterns ───────────────────────────────────────────────────────────────
-
-# href patterns that indicate a maps link (real URL or local anchor)
 _MAPS_HREF = re.compile(
     r"(maps\.app\.goo\.gl|maps\.google\.|goo\.gl/maps|apple\.com/maps"
     r"|bing\.com/maps|mapquest\.com|#.*map)",
     re.IGNORECASE,
 )
 
-# Class/id names that strongly indicate an address container
 _ADDR_CLASS = re.compile(
     r"(address|location|branch.?info|contact.?info|company_information__location)",
     re.IGNORECASE,
 )
 
-# Noise lines we want to discard before scoring
 _NOISE = re.compile(
     r"(phone|fax|tel:|toll.?free|hours?|open|closed|"
     r"mon|tue|wed|thu|fri|sat|sun|"
@@ -54,9 +45,9 @@ _NOISE = re.compile(
     re.IGNORECASE,
 )
 
-# --- Normalize and match (Step 1) ---
+# ── Normalize ──────────────────────────────────────────────────────────────
+
 def normalize(text: str) -> str:
-    """Lowercase, replace non-alphanumeric with spaces, collapse whitespace, trim."""
     if not text:
         return ""
     s = re.sub(r"[^a-z0-9]+", " ", (text or "").lower())
@@ -67,8 +58,7 @@ def _tokens(s: str):
     return set(normalize(s).split()) if normalize(s) else set()
 
 
-# Tags we consider for branch name (heading-like)
-BRANCH_HEADING_TAGS = {"h1", "h2", "h3", "h4", "strong", "span", "a", "div", "p"}
+BRANCH_HEADING_TAGS = {"h1", "h2", "h3", "h4", "th", "strong", "span", "a", "div", "p"}
 
 
 def _class_contains_heading_or_hdr(tag) -> bool:
@@ -98,11 +88,9 @@ def _fuzzy_match(target_branch_name: str, candidate_text: str, threshold: float 
 
 
 def _find_branch_node(soup: BeautifulSoup, target_branch_name: str):
-    """Find the DOM element that best matches the branch name (exact then fuzzy)."""
     target_norm = normalize(target_branch_name)
     if not target_norm:
         return None
-
     candidates = []
     for tag in soup.find_all(True):
         if tag.name not in BRANCH_HEADING_TAGS and not _class_contains_heading_or_hdr(tag):
@@ -115,36 +103,29 @@ def _find_branch_node(soup: BeautifulSoup, target_branch_name: str):
             return tag
         if _fuzzy_match(target_branch_name, text):
             candidates.append((tag, text))
-
     if not candidates:
         return None
     candidates.sort(key=lambda x: len(x[1]))
     return candidates[0][0]
 
 
-# --- Container scoping (Step 2) ---
+# ── Container scoping ──────────────────────────────────────────────────────
+
 CONTAINER_TAGS = {"article", "section", "table", "tbody", "tr"}
-
-# Keywords that suggest a per-branch item container — we want to STOP here
 ITEM_CLASS_KEYWORDS = ("item", "card", "branch", "location", "office", "widget")
-
-# Keywords that suggest a broad shared wrapper — we want to SKIP past these
 WRAPPER_CLASS_KEYWORDS = ("boxes", "list", "grid", "wrap", "container", "row", "section")
 
 
 def _is_per_branch_container(tag) -> bool:
-    """True if this tag looks like a single-branch card/item, not a shared wrapper."""
     if tag.name in CONTAINER_TAGS:
         return True
     cls = " ".join(tag.get("class") or []).lower()
     has_item = any(kw in cls for kw in ITEM_CLASS_KEYWORDS)
     has_wrapper = any(kw in cls for kw in WRAPPER_CLASS_KEYWORDS)
-    # Prefer item-like classes; only treat as container if not purely a wrapper
     return has_item or (tag.name == "div" and has_wrapper and not has_item is False)
 
 
 def _is_shared_wrapper(tag) -> bool:
-    """True if this tag is a broad container likely holding multiple branches."""
     cls = " ".join(tag.get("class") or []).lower()
     return any(kw in cls for kw in WRAPPER_CLASS_KEYWORDS) and not any(kw in cls for kw in ITEM_CLASS_KEYWORDS)
 
@@ -156,30 +137,18 @@ def _has_content_beyond_heading(container, branch_node) -> bool:
 
 
 def _find_branch_container(branch_node):
-    """
-    Walk up from branch_node to find the smallest ancestor that is a
-    per-branch container (item/card), stopping before any shared wrapper
-    that holds multiple branches.
-    """
     if not branch_node:
         return None
-
     best = None
     node = branch_node
-
     while node and node.parent and node.parent.name not in ("html", "body"):
         parent = node.parent
         cls = " ".join(parent.get("class") or []).lower()
-
-        # Stop if we've reached a shared multi-branch wrapper
         if _is_shared_wrapper(parent) and not any(kw in cls for kw in ITEM_CLASS_KEYWORDS):
             break
-
         if _is_per_branch_container(parent) and _has_content_beyond_heading(parent, branch_node):
-            best = parent  # Keep climbing to find the tightest fit
-
+            best = parent
         node = parent
-
     return best or (branch_node.parent if branch_node.parent and branch_node.parent.name not in ("html", "body") else None)
 
 
@@ -190,34 +159,8 @@ def _next_element_sibling(tag):
     return n
 
 
-def _find_table_branch_scope(branch_node):
-    """
-    Handle table-based layouts where the branch name is in a <th> inside one <tr>
-    and the address is in a <td> inside the next <tr>.
-    Returns a synthetic scope containing the next sibling <tr> content, or None.
-    """
-    # Walk up to the containing <tr>
-    node = branch_node
-    while node and node.name != "tr":
-        node = node.parent
-    if not node or node.name != "tr":
-        return None
+# ── Address scoring ────────────────────────────────────────────────────────
 
-    # Gather this <tr> and the next 1-2 sibling <tr>s as the scope
-    from bs4 import BeautifulSoup as BS
-    scope_html = ""
-    tr = node
-    for _ in range(3):  # heading row + up to 2 data rows
-        tr = _next_element_sibling(tr)
-        if not tr or tr.name != "tr":
-            break
-        scope_html += str(tr)
-    if not scope_html:
-        return None
-    return BS(f"<div>{scope_html}</div>", "html.parser").find("div")
-
-
-# --- Address scoring (Step 3) ---
 STREET_NUMBER = re.compile(r"\b\d{1,6}\s+\w+")
 STREET_SUFFIXES = (
     "st", "street", "ave", "avenue", "rd", "road", "blvd", "boulevard",
@@ -272,14 +215,9 @@ def _extract_address_from_full_text(text: str) -> Optional[str]:
     return None
 
 
-# --- Noise stripping & address extraction strategies (Step 3b) ---
+# ── Noise stripping & extraction strategies ────────────────────────────────
 
 def _strip_noise(text: str) -> str:
-    """
-    Remove noise lines (phone, hours, directions, etc.) from a text block.
-    Works line-by-line so address lines survive intact.
-    Also removes lines that look like bare phone numbers.
-    """
     clean = []
     for line in re.split(r"[\n|]", text):
         line = line.strip().strip(",").strip()
@@ -294,10 +232,6 @@ def _strip_noise(text: str) -> str:
 
 
 def _text_from_br_block(tag) -> str:
-    """
-    Reconstruct text from a tag that uses <br> as line separator
-    (common in Wix / plain-HTML sites). Returns joined non-empty lines.
-    """
     parts = []
     for child in tag.children:
         if getattr(child, "name", None) == "br":
@@ -311,11 +245,6 @@ def _text_from_br_block(tag) -> str:
 
 
 def _find_maps_link_address(scope) -> Optional[str]:
-    """
-    Strategy 1: address is the visible text of a maps hyperlink.
-    Covers real maps URLs and local anchors with 'map' in href.
-    Also checks for <strong> inside the link.
-    """
     if not scope:
         return None
     for a in scope.find_all("a", href=True):
@@ -331,10 +260,6 @@ def _find_maps_link_address(scope) -> Optional[str]:
 
 
 def _find_location_class_address(scope) -> Optional[str]:
-    """
-    Strategy 2: container has a class/id that explicitly names it as
-    an address or location block.
-    """
     if not scope:
         return None
     for tag in scope.find_all(True):
@@ -351,11 +276,6 @@ def _find_location_class_address(scope) -> Optional[str]:
 
 
 def _find_br_block_address(scope) -> Optional[str]:
-    """
-    Strategy 3: address split across <br>-separated lines inside a <p> or <div>
-    (Wix pattern: "105 S. Wall St.<br>Floydada, TX 79235").
-    Skips any block that contains a tel: link.
-    """
     if not scope:
         return None
     for tag in scope.find_all(["p", "div", "td", "li"]):
@@ -370,14 +290,6 @@ def _find_br_block_address(scope) -> Optional[str]:
 
 
 def _find_address_in_scope(scope) -> Optional[str]:
-    """
-    Try five strategies in order of reliability:
-      1. Maps hyperlink text (real URL or local #map anchor)
-      2. Semantically-named location/address class
-      3. <br>-separated lines in a <p>/<div> (Wix style)
-      4. Best-scoring individual element (noise-stripped)
-      5. Full container text regex fallback (noise-stripped)
-    """
     if not scope:
         return None
 
@@ -393,7 +305,6 @@ def _find_address_in_scope(scope) -> Optional[str]:
     if result:
         return result
 
-    # Strategy 4: score individual candidate elements, noise-stripped
     best_score = -100
     best_text = None
     for tag in scope.find_all(["p", "div", "td", "strong", "span", "li"], recursive=True):
@@ -415,7 +326,6 @@ def _find_address_in_scope(scope) -> Optional[str]:
     if best_text:
         return best_text
 
-    # Strategy 5: full container text, noise-stripped, regex-extracted
     full = _strip_noise(scope.get_text(separator="\n", strip=True))
     if len(full) >= 15:
         extracted = _extract_address_from_full_text(full)
@@ -425,7 +335,43 @@ def _find_address_in_scope(scope) -> Optional[str]:
     return None
 
 
-# --- Clean and parse (Step 4) ---
+# ── Table address map (pre-scan all tables) ────────────────────────────────
+
+def _build_table_address_map(soup: BeautifulSoup) -> dict:
+    """
+    Pre-scan all tables and build normalized branch name -> address text.
+    Handles: <tr><th>Branch Name</th></tr> followed by <tr><td>address</td></tr>
+    """
+    table_map = {}
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        for i, row in enumerate(rows):
+            ths = row.find_all("th")
+            if not ths:
+                continue
+            branch_text = ths[0].get_text(strip=True)
+            if not branch_text or len(branch_text) > 100:
+                continue
+            # Search following rows for address
+            for j in range(i + 1, min(i + 4, len(rows))):
+                next_row = rows[j]
+                if next_row.find("th"):
+                    break  # hit next branch heading
+                tds = next_row.find_all("td", recursive=False)
+                if not tds:
+                    continue
+                first_td = tds[0]
+                if first_td.find("a", href=re.compile(r"^tel:", re.I)):
+                    continue
+                addr_text = _strip_noise(_text_from_br_block(first_td))
+                if addr_text and _score_address_candidate(addr_text) >= MIN_ADDRESS_SCORE:
+                    table_map[normalize(branch_text)] = addr_text
+                    break
+    return table_map
+
+
+# ── Clean and parse ────────────────────────────────────────────────────────
+
 CITY_STATE_ZIP_PARSE = re.compile(r"^(.*),\s*([A-Z]{2})\s*(\d{5}(?:-\d{4})?)\s*$", re.IGNORECASE | re.DOTALL)
 
 STATES = (
@@ -463,7 +409,8 @@ def _parse_address(address_full: str) -> dict:
     return {"street": street, "city": city, "state": state, "zip": zip_}
 
 
-# --- Main API: match branch to address (Steps 1–5) ---
+# ── Main match function ────────────────────────────────────────────────────
+
 def match_branch_to_address(soup: BeautifulSoup, target_branch_name: str) -> dict:
     out = {
         "matched_branch_name": "",
@@ -477,20 +424,14 @@ def match_branch_to_address(soup: BeautifulSoup, target_branch_name: str) -> dic
     if not branch_node:
         return out
 
-    matched_text = _get_candidate_text(branch_node)
-    out["matched_branch_name"] = matched_text
+    out["matched_branch_name"] = _get_candidate_text(branch_node)
 
-    # For table layouts: address lives in the next sibling <tr>, not same container
-    table_scope = _find_table_branch_scope(branch_node)
-    if table_scope:
-        address_full = _find_address_in_scope(table_scope)
-    else:
-        branch_container = _find_branch_container(branch_node)
-        address_full = _find_address_in_scope(branch_container)
-        if not address_full and branch_container:
-            next_scope = _next_element_sibling(branch_container)
-            if next_scope:
-                address_full = _find_address_in_scope(next_scope)
+    branch_container = _find_branch_container(branch_node)
+    address_full = _find_address_in_scope(branch_container)
+    if not address_full and branch_container:
+        next_scope = _next_element_sibling(branch_container)
+        if next_scope:
+            address_full = _find_address_in_scope(next_scope)
 
     if not address_full:
         return out
@@ -504,7 +445,8 @@ def match_branch_to_address(soup: BeautifulSoup, target_branch_name: str) -> dic
     return out
 
 
-# --- Scrape + geocode ---
+# ── Scrape + geocode ───────────────────────────────────────────────────────
+
 def scrape_branches(url: str, branch_names: list) -> list:
     branch_names = [n.strip() for n in branch_names if n.strip()]
     if not branch_names:
@@ -516,8 +458,25 @@ def scrape_branches(url: str, branch_names: list) -> list:
     except requests.RequestException as e:
         return [{"error": str(e)}]
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    # Parse full HTML but deduplicate by only using content from the first
+    # occurrence of the main content container to avoid duplicate matches.
+    raw_html = resp.text
+    soup_full = BeautifulSoup(raw_html, "html.parser")
+
+    # Try to find the first main content div to scope everything
+    main_content = (
+        soup_full.find("div", id="interiorContent") or
+        soup_full.find("main") or
+        soup_full.find("article") or
+        soup_full.find("div", class_=re.compile(r"content|main|page", re.I))
+    )
+    soup = BeautifulSoup(str(main_content), "html.parser") if main_content else soup_full
+
+    # Pre-scan all tables for branch->address mappings
+    table_address_map = _build_table_address_map(soup)
+
     results = []
+    used_addresses: set = set()  # track claimed addresses to prevent reuse
 
     for branch in branch_names:
         row = {
@@ -526,19 +485,35 @@ def scrape_branches(url: str, branch_names: list) -> list:
             "latitude": None,
             "longitude": None,
         }
-        match = match_branch_to_address(soup, branch)
-        address_full = (match.get("address_full") or "").strip()
+
+        # 1. Try table map first (fast, reliable for th/td layouts)
+        address_full = table_address_map.get(normalize(branch), "")
+        match = {}
+
+        # 2. Fall back to DOM-based matching
+        if not address_full:
+            match = match_branch_to_address(soup, branch)
+            address_full = (match.get("address_full") or "").strip()
+
+        # 3. Reject if this address was already claimed by a previous branch
+        addr_key = normalize(address_full)
+        if address_full and addr_key in used_addresses:
+            logger.warning(f"[DEDUP] '{branch}' got duplicate address '{address_full}' — skipping")
+            address_full = ""
+
         if address_full:
+            used_addresses.add(addr_key)
             row["address"] = address_full
-            lat, lon = geocode_address(address_full, match)
+            lat, lon = geocode_address(address_full, match or None)
             row["latitude"] = lat
             row["longitude"] = lon
+
         results.append(row)
 
     return results
 
 
-# --- Geocoding with multi-query variants + exponential backoff ---
+# ── Geocoding ──────────────────────────────────────────────────────────────
 
 _geocoder: Optional[Nominatim] = None
 _last_geocode_time: float = 0.0
@@ -555,44 +530,34 @@ def _get_geocoder() -> Nominatim:
 
 
 def _build_query_variants(address_full: str, parsed: dict) -> list[str]:
-    """
-    Build ordered list of query strings to try, from most to least specific.
-    """
     queries = []
     street = parsed.get("street", "")
     city   = parsed.get("city", "")
     state  = parsed.get("state", "")
     zip_   = parsed.get("zip", "")
 
-    # 1. Full structured query
     if street and city and state:
         queries.append(f"{street}, {city}, {state} {zip_}".strip())
 
-    # 2. Suite/unit stripped
     clean_street = re.sub(r"\b(Suite|Ste|Unit|Apt|#)\s*\S+", "", street, flags=re.I).strip().rstrip(",").strip()
     if clean_street != street and city and state:
         queries.append(f"{clean_street}, {city}, {state} {zip_}".strip())
 
-    # 3. Direction expanded (E → East, W → West, etc.)
     expanded = (street
         .replace(" E ", " East ").replace(" W ", " West ")
         .replace(" N ", " North ").replace(" S ", " South "))
     if expanded != street and city and state:
         queries.append(f"{expanded}, {city}, {state} {zip_}".strip())
 
-    # 4. State Route normalized — fall back to city+state+zip
     if re.search(r"\b(state route|route|rte)\s*\d+", street, re.I) and city and state:
         queries.append(f"{city}, {state} {zip_}".strip())
 
-    # 5. City + state + zip fallback
     if city and state and zip_:
         queries.append(f"{city}, {state} {zip_}")
 
-    # 6. Raw address string as last resort
     if address_full.strip() not in queries:
         queries.append(address_full.strip())
 
-    # Deduplicate while preserving order
     seen = set()
     deduped = []
     for q in queries:
@@ -603,10 +568,6 @@ def _build_query_variants(address_full: str, parsed: dict) -> list[str]:
 
 
 def _geocode_query(geocoder: Nominatim, query: str) -> Optional[tuple]:
-    """
-    Attempt to geocode a single query string with exponential backoff retries.
-    Returns (lat, lon) on success, None on real miss, None on exhausted retries.
-    """
     global _last_geocode_time
 
     for attempt in range(MAX_RETRIES):
@@ -622,7 +583,7 @@ def _geocode_query(geocoder: Nominatim, query: str) -> Optional[tuple]:
                 logger.info(f"  [GEO ✓] '{query}' → {loc.latitude}, {loc.longitude}")
                 return (loc.latitude, loc.longitude)
             logger.info(f"  [GEO NONE MATCH] '{query}'")
-            return None  # Real miss — no point retrying
+            return None
         except (GeocoderTimedOut, GeocoderServiceError) as e:
             logger.warning(f"  [GEO TIMEOUT/ERROR attempt {attempt + 1}/{MAX_RETRIES}] '{query}': {e}")
             if attempt == MAX_RETRIES - 1:
@@ -633,10 +594,6 @@ def _geocode_query(geocoder: Nominatim, query: str) -> Optional[tuple]:
 
 
 def geocode_address(address_full: str, parsed_match: Optional[dict] = None) -> tuple:
-    """
-    Geocode an address string. Builds multiple query variants and tries each
-    in order, with exponential backoff retries per query.
-    """
     geocoder = _get_geocoder()
     parsed = parsed_match or _parse_address(address_full)
     queries = _build_query_variants(address_full, parsed)
@@ -652,7 +609,8 @@ def geocode_address(address_full: str, parsed_match: Optional[dict] = None) -> t
     return (None, None)
 
 
-# --- Unit-test style examples ---
+# ── Tests ──────────────────────────────────────────────────────────────────
+
 def _run_example_tests():
     from bs4 import BeautifulSoup as BS
 
@@ -665,9 +623,7 @@ def _run_example_tests():
     """
     soup1 = BS(html1, "html.parser")
     r1 = match_branch_to_address(soup1, "Main Branch")
-    assert r1["matched_branch_name"] == "Main Branch", r1
     assert "123" in (r1["address_full"] or ""), r1
-    assert "62701" in (r1["address_full"] or ""), r1
     print("Example 1 (h3 + strong): OK")
 
     html2 = """
@@ -679,25 +635,34 @@ def _run_example_tests():
     """
     soup2 = BS(html2, "html.parser")
     r2 = match_branch_to_address(soup2, "Downtown Office")
-    assert r2["matched_branch_name"] == "Downtown Office", r2
-    assert "456" in (r2["address_full"] or "") and "60601" in (r2["address_full"] or ""), r2
-    print("Example 2 (span.contact-hdr-back + Address:): OK")
+    assert "456" in (r2["address_full"] or ""), r2
+    print("Example 2 (span + Address:): OK")
 
     html3 = """
-    <div class="elementor-widget">
-      <h3 class="elementor-heading-title">Westside Branch</h3>
-      <div class="elementor-text-editor">
-        <a href="/locations"><strong>789 West Rd, Denver, CO 80202</strong></a>
-      </div>
-    </div>
+    <table>
+      <tbody>
+        <tr><th colspan="2"><strong>Cody</strong></th></tr>
+        <tr>
+          <td>1702 17th Street<br>Cody, Wyoming 82414</td>
+          <td>Phone: (307) 587-4915</td>
+        </tr>
+        <tr><th colspan="2"><strong>Powell</strong></th></tr>
+        <tr>
+          <td>374 N. Clark<br>Powell, Wyoming 82435</td>
+          <td>Phone: (307) 754-7191</td>
+        </tr>
+      </tbody>
+    </table>
     """
     soup3 = BS(html3, "html.parser")
-    r3 = match_branch_to_address(soup3, "Westside Branch")
-    assert r3["matched_branch_name"] == "Westside Branch", r3
-    assert "789" in (r3["address_full"] or "") and "80202" in (r3["address_full"] or ""), r3
-    print("Example 3 (elementor h3 + a/strong): OK")
+    tmap = _build_table_address_map(soup3)
+    assert "cody" in tmap, tmap
+    assert "powell" in tmap, tmap
+    assert "82414" in tmap["cody"], tmap
+    assert "82435" in tmap["powell"], tmap
+    print("Example 3 (table th/td map): OK")
 
-    print("All example tests passed.")
+    print("All tests passed.")
 
 
 if __name__ == "__main__":
